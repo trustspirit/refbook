@@ -2,7 +2,6 @@ import os
 import uuid
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-import asyncio
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -12,19 +11,22 @@ from langchain.prompts import ChatPromptTemplate
 from langchain.schema import Document
 
 from app.config import get_settings
-from app.models import Resource, ResourceStatus, ChatMessage
+from app.models import Project, Resource, ResourceStatus, ChatMessage, ShareSession
+from app.database import SessionLocal, ProjectDB, ResourceDB, ShareSessionDB, ResourceStatusEnum, init_db
 from app.scraper import scraper
 
 
 class RAGService:
-    """Service for managing RAG operations."""
+    """Service for managing RAG operations with project support."""
     
     def __init__(self):
         self.settings = get_settings()
         self._embeddings = None
         self._vectorstore = None
         self._llm = None
-        self._resources: Dict[str, Resource] = {}
+        
+        # Initialize database
+        init_db()
         
         # Text splitter for chunking
         self.text_splitter = RecursiveCharacterTextSplitter(
@@ -45,6 +47,43 @@ Context:
 Previous conversation:
 {history}
 """
+    
+    def _get_db(self):
+        """Get a database session."""
+        return SessionLocal()
+    
+    def _db_to_project(self, db_project: ProjectDB) -> Project:
+        """Convert DB model to Pydantic model."""
+        return Project(
+            id=db_project.id,
+            name=db_project.name,
+            description=db_project.description,
+            created_at=db_project.created_at,
+            updated_at=db_project.updated_at
+        )
+    
+    def _db_to_resource(self, db_resource: ResourceDB) -> Resource:
+        """Convert DB model to Pydantic model."""
+        return Resource(
+            id=db_resource.id,
+            project_id=db_resource.project_id,
+            url=db_resource.url,
+            name=db_resource.name,
+            status=ResourceStatus(db_resource.status.value),
+            chunk_count=db_resource.chunk_count,
+            created_at=db_resource.created_at,
+            updated_at=db_resource.updated_at,
+            error_message=db_resource.error_message
+        )
+    
+    def _db_to_share_session(self, db_session: ShareSessionDB) -> ShareSession:
+        """Convert DB model to Pydantic model."""
+        return ShareSession(
+            id=db_session.id,
+            project_id=db_session.project_id,
+            name=db_session.name,
+            created_at=db_session.created_at
+        )
     
     @property
     def embeddings(self):
@@ -82,53 +121,152 @@ Previous conversation:
             )
         return self._llm
     
-    async def add_resource(self, url: str, name: Optional[str] = None) -> Resource:
-        """Add a new resource from URL."""
-        resource_id = str(uuid.uuid4())
-        now = datetime.utcnow()
-        
-        # Create resource entry
-        resource = Resource(
-            id=resource_id,
-            url=url,
-            name=name or url,
-            status=ResourceStatus.PROCESSING,
-            created_at=now,
-            updated_at=now
-        )
-        self._resources[resource_id] = resource
-        
-        try:
-            # Scrape content
-            title, content = await scraper.scrape_url(url)
-            
-            if name is None:
-                resource.name = title
-            
-            # Process and store
-            chunk_count = await self._process_content(resource_id, url, content)
-            
-            resource.chunk_count = chunk_count
-            resource.status = ResourceStatus.READY
-            resource.updated_at = datetime.utcnow()
-            
-        except Exception as e:
-            resource.status = ResourceStatus.ERROR
-            resource.error_message = str(e)
-            resource.updated_at = datetime.utcnow()
-        
-        return resource
+    # ============ Project Methods ============
     
-    async def _process_content(self, resource_id: str, url: str, content: str) -> int:
+    def create_project(self, name: str, description: Optional[str] = None) -> Project:
+        """Create a new project."""
+        db = self._get_db()
+        try:
+            db_project = ProjectDB(
+                id=str(uuid.uuid4()),
+                name=name,
+                description=description
+            )
+            db.add(db_project)
+            db.commit()
+            db.refresh(db_project)
+            return self._db_to_project(db_project)
+        finally:
+            db.close()
+    
+    def get_project(self, project_id: str) -> Optional[Project]:
+        """Get a project by ID."""
+        db = self._get_db()
+        try:
+            db_project = db.query(ProjectDB).filter(ProjectDB.id == project_id).first()
+            return self._db_to_project(db_project) if db_project else None
+        finally:
+            db.close()
+    
+    def get_all_projects(self) -> List[Project]:
+        """Get all projects."""
+        db = self._get_db()
+        try:
+            db_projects = db.query(ProjectDB).order_by(ProjectDB.created_at.desc()).all()
+            return [self._db_to_project(p) for p in db_projects]
+        finally:
+            db.close()
+    
+    def update_project(self, project_id: str, name: Optional[str] = None, description: Optional[str] = None) -> Optional[Project]:
+        """Update a project."""
+        db = self._get_db()
+        try:
+            db_project = db.query(ProjectDB).filter(ProjectDB.id == project_id).first()
+            if not db_project:
+                return None
+            
+            if name is not None:
+                db_project.name = name
+            if description is not None:
+                db_project.description = description
+            db_project.updated_at = datetime.utcnow()
+            
+            db.commit()
+            db.refresh(db_project)
+            return self._db_to_project(db_project)
+        finally:
+            db.close()
+    
+    async def delete_project(self, project_id: str) -> bool:
+        """Delete a project and all its resources."""
+        db = self._get_db()
+        try:
+            db_project = db.query(ProjectDB).filter(ProjectDB.id == project_id).first()
+            if not db_project:
+                return False
+            
+            # Delete vectors for all resources in this project
+            db_resources = db.query(ResourceDB).filter(ResourceDB.project_id == project_id).all()
+            for resource in db_resources:
+                await self._delete_resource_vectors(resource.id)
+            
+            # Delete project (cascade will delete resources and share sessions)
+            db.delete(db_project)
+            db.commit()
+            return True
+        finally:
+            db.close()
+    
+    def get_project_stats(self, project_id: str) -> Dict[str, int]:
+        """Get resource stats for a project."""
+        db = self._get_db()
+        try:
+            resources = db.query(ResourceDB).filter(ResourceDB.project_id == project_id).all()
+            return {
+                "total": len(resources),
+                "ready": len([r for r in resources if r.status == ResourceStatusEnum.READY]),
+                "processing": len([r for r in resources if r.status == ResourceStatusEnum.PROCESSING]),
+                "error": len([r for r in resources if r.status == ResourceStatusEnum.ERROR])
+            }
+        finally:
+            db.close()
+    
+    # ============ Resource Methods ============
+    
+    async def add_resource(self, project_id: str, url: str, name: Optional[str] = None) -> Resource:
+        """Add a new resource to a project."""
+        db = self._get_db()
+        try:
+            # Check project exists
+            db_project = db.query(ProjectDB).filter(ProjectDB.id == project_id).first()
+            if not db_project:
+                raise ValueError(f"Project {project_id} not found")
+            
+            resource_id = str(uuid.uuid4())
+            db_resource = ResourceDB(
+                id=resource_id,
+                project_id=project_id,
+                url=url,
+                name=name or url,
+                status=ResourceStatusEnum.PROCESSING
+            )
+            db.add(db_resource)
+            db.commit()
+            db.refresh(db_resource)
+            
+            # Process in background
+            try:
+                title, content = await scraper.scrape_url(url)
+                
+                if name is None:
+                    db_resource.name = title
+                
+                chunk_count = await self._process_content(project_id, resource_id, url, content)
+                
+                db_resource.chunk_count = chunk_count
+                db_resource.status = ResourceStatusEnum.READY
+                db_resource.updated_at = datetime.utcnow()
+                
+            except Exception as e:
+                db_resource.status = ResourceStatusEnum.ERROR
+                db_resource.error_message = str(e)
+                db_resource.updated_at = datetime.utcnow()
+            
+            db.commit()
+            db.refresh(db_resource)
+            return self._db_to_resource(db_resource)
+        finally:
+            db.close()
+    
+    async def _process_content(self, project_id: str, resource_id: str, url: str, content: str) -> int:
         """Process content and add to vector store."""
-        # Split into chunks
         chunks = self.text_splitter.split_text(content)
         
-        # Create documents with metadata
         documents = [
             Document(
                 page_content=chunk,
                 metadata={
+                    "project_id": project_id,
                     "resource_id": resource_id,
                     "url": url,
                     "chunk_index": i
@@ -137,85 +275,198 @@ Previous conversation:
             for i, chunk in enumerate(chunks)
         ]
         
-        # Add to vector store
         if documents:
             self.vectorstore.add_documents(documents)
         
         return len(documents)
     
-    async def refresh_resource(self, resource_id: str) -> Resource:
+    async def refresh_resource(self, project_id: str, resource_id: str) -> Resource:
         """Refresh a resource by re-scraping and updating vectors."""
-        if resource_id not in self._resources:
-            raise ValueError(f"Resource {resource_id} not found")
-        
-        resource = self._resources[resource_id]
-        resource.status = ResourceStatus.PROCESSING
-        resource.updated_at = datetime.utcnow()
-        
+        db = self._get_db()
         try:
-            # Delete old vectors for this resource
-            await self._delete_resource_vectors(resource_id)
+            db_resource = db.query(ResourceDB).filter(
+                ResourceDB.id == resource_id,
+                ResourceDB.project_id == project_id
+            ).first()
             
-            # Re-scrape
-            title, content = await scraper.scrape_url(resource.url)
+            if not db_resource:
+                raise ValueError(f"Resource {resource_id} not found")
             
-            # Re-process
-            chunk_count = await self._process_content(resource_id, resource.url, content)
+            db_resource.status = ResourceStatusEnum.PROCESSING
+            db_resource.updated_at = datetime.utcnow()
+            db.commit()
             
-            resource.chunk_count = chunk_count
-            resource.status = ResourceStatus.READY
-            resource.updated_at = datetime.utcnow()
+            try:
+                await self._delete_resource_vectors(resource_id)
+                title, content = await scraper.scrape_url(db_resource.url)
+                chunk_count = await self._process_content(project_id, resource_id, db_resource.url, content)
+                
+                db_resource.chunk_count = chunk_count
+                db_resource.status = ResourceStatusEnum.READY
+                db_resource.error_message = None
+                db_resource.updated_at = datetime.utcnow()
+                
+            except Exception as e:
+                db_resource.status = ResourceStatusEnum.ERROR
+                db_resource.error_message = str(e)
+                db_resource.updated_at = datetime.utcnow()
             
-        except Exception as e:
-            resource.status = ResourceStatus.ERROR
-            resource.error_message = str(e)
-            resource.updated_at = datetime.utcnow()
-        
-        return resource
+            db.commit()
+            db.refresh(db_resource)
+            return self._db_to_resource(db_resource)
+        finally:
+            db.close()
     
     async def _delete_resource_vectors(self, resource_id: str):
         """Delete all vectors for a resource."""
         try:
-            # Get all IDs for this resource
-            results = self.vectorstore.get(
-                where={"resource_id": resource_id}
-            )
+            results = self.vectorstore.get(where={"resource_id": resource_id})
             if results and results.get("ids"):
                 self.vectorstore.delete(ids=results["ids"])
         except Exception:
-            pass  # Collection might not exist yet
+            pass
     
-    async def delete_resource(self, resource_id: str) -> bool:
+    async def delete_resource(self, project_id: str, resource_id: str) -> bool:
         """Delete a resource and its vectors."""
-        if resource_id not in self._resources:
-            return False
-        
-        await self._delete_resource_vectors(resource_id)
-        del self._resources[resource_id]
-        return True
+        db = self._get_db()
+        try:
+            db_resource = db.query(ResourceDB).filter(
+                ResourceDB.id == resource_id,
+                ResourceDB.project_id == project_id
+            ).first()
+            
+            if not db_resource:
+                return False
+            
+            await self._delete_resource_vectors(resource_id)
+            db.delete(db_resource)
+            db.commit()
+            return True
+        finally:
+            db.close()
     
     def get_resource(self, resource_id: str) -> Optional[Resource]:
         """Get a resource by ID."""
-        return self._resources.get(resource_id)
+        db = self._get_db()
+        try:
+            db_resource = db.query(ResourceDB).filter(ResourceDB.id == resource_id).first()
+            return self._db_to_resource(db_resource) if db_resource else None
+        finally:
+            db.close()
     
-    def get_all_resources(self) -> List[Resource]:
-        """Get all resources."""
-        return list(self._resources.values())
+    def get_project_resources(self, project_id: str) -> List[Resource]:
+        """Get all resources for a project."""
+        db = self._get_db()
+        try:
+            db_resources = db.query(ResourceDB).filter(
+                ResourceDB.project_id == project_id
+            ).order_by(ResourceDB.created_at.desc()).all()
+            return [self._db_to_resource(r) for r in db_resources]
+        finally:
+            db.close()
+    
+    # ============ Share Session Methods ============
+    
+    def create_share_session(self, project_id: str, name: Optional[str] = None) -> ShareSession:
+        """Create a share session for a project."""
+        db = self._get_db()
+        try:
+            db_project = db.query(ProjectDB).filter(ProjectDB.id == project_id).first()
+            if not db_project:
+                raise ValueError(f"Project {project_id} not found")
+            
+            ready_count = db.query(ResourceDB).filter(
+                ResourceDB.project_id == project_id,
+                ResourceDB.status == ResourceStatusEnum.READY
+            ).count()
+            
+            if ready_count == 0:
+                raise ValueError("No ready resources to share")
+            
+            session_id = str(uuid.uuid4())[:8]
+            db_session = ShareSessionDB(
+                id=session_id,
+                project_id=project_id,
+                name=name or db_project.name
+            )
+            db.add(db_session)
+            db.commit()
+            db.refresh(db_session)
+            return self._db_to_share_session(db_session)
+        finally:
+            db.close()
+    
+    def get_share_session(self, session_id: str) -> Optional[ShareSession]:
+        """Get a share session by ID."""
+        db = self._get_db()
+        try:
+            db_session = db.query(ShareSessionDB).filter(ShareSessionDB.id == session_id).first()
+            return self._db_to_share_session(db_session) if db_session else None
+        finally:
+            db.close()
+    
+    def get_share_session_resources(self, session_id: str) -> List[Resource]:
+        """Get resources for a share session."""
+        db = self._get_db()
+        try:
+            db_session = db.query(ShareSessionDB).filter(ShareSessionDB.id == session_id).first()
+            if not db_session:
+                return []
+            
+            db_resources = db.query(ResourceDB).filter(
+                ResourceDB.project_id == db_session.project_id,
+                ResourceDB.status == ResourceStatusEnum.READY
+            ).all()
+            return [self._db_to_resource(r) for r in db_resources]
+        finally:
+            db.close()
+    
+    def delete_share_session(self, session_id: str) -> bool:
+        """Delete a share session."""
+        db = self._get_db()
+        try:
+            db_session = db.query(ShareSessionDB).filter(ShareSessionDB.id == session_id).first()
+            if not db_session:
+                return False
+            db.delete(db_session)
+            db.commit()
+            return True
+        finally:
+            db.close()
+    
+    def get_project_share_sessions(self, project_id: str) -> List[ShareSession]:
+        """Get all share sessions for a project."""
+        db = self._get_db()
+        try:
+            db_sessions = db.query(ShareSessionDB).filter(
+                ShareSessionDB.project_id == project_id
+            ).order_by(ShareSessionDB.created_at.desc()).all()
+            return [self._db_to_share_session(s) for s in db_sessions]
+        finally:
+            db.close()
+    
+    # ============ Chat Methods ============
     
     async def chat(
         self,
+        project_id: str,
         message: str,
         resource_ids: Optional[List[str]] = None,
         conversation_history: Optional[List[ChatMessage]] = None
     ) -> Dict[str, Any]:
-        """Chat with the RAG system."""
+        """Chat with the RAG system for a specific project."""
         
-        # Build filter if specific resources are requested
-        where_filter = None
+        # Build filter for this project
         if resource_ids:
-            where_filter = {"resource_id": {"$in": resource_ids}}
+            where_filter = {
+                "$and": [
+                    {"project_id": project_id},
+                    {"resource_id": {"$in": resource_ids}}
+                ]
+            }
+        else:
+            where_filter = {"project_id": project_id}
         
-        # Search for relevant chunks
         try:
             results = self.vectorstore.similarity_search_with_score(
                 message,
@@ -231,34 +482,31 @@ Previous conversation:
                 "sources": []
             }
         
-        # Build context from results
         context_parts = []
         sources = []
-        for doc, score in results:
+        for doc, distance in results:
             context_parts.append(f"[Source: {doc.metadata.get('url', 'Unknown')}]\n{doc.page_content}")
+            similarity = 1 / (1 + float(distance))
             sources.append({
                 "url": doc.metadata.get("url", ""),
                 "content": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
-                "score": float(score)
+                "score": similarity
             })
         
         context = "\n\n---\n\n".join(context_parts)
         
-        # Build conversation history
         history = ""
         if conversation_history:
             history_parts = []
-            for msg in conversation_history[-5:]:  # Last 5 messages
+            for msg in conversation_history[-5:]:
                 history_parts.append(f"{msg.role}: {msg.content}")
             history = "\n".join(history_parts)
         
-        # Create prompt
         prompt = ChatPromptTemplate.from_messages([
             ("system", self.system_prompt),
             ("human", "{question}")
         ])
         
-        # Generate response
         chain = prompt | self.llm
         response = await chain.ainvoke({
             "context": context,

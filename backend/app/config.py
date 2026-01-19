@@ -6,6 +6,9 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = ""
     
+    # Database
+    database_url: str = "sqlite:///./refbook.db"  # Default to SQLite for local dev
+    
     # ChromaDB
     chroma_persist_directory: str = "./chroma_db"
     
@@ -15,7 +18,7 @@ class Settings(BaseSettings):
     
     # Server
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 6061
     
     # RAG Settings
     chunk_size: int = 1000
